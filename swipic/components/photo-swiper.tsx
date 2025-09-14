@@ -337,6 +337,19 @@ export default function PhotoSwiper() {
     );
   }
 
+  if (photos.length === 0 && permissionStatus === "granted") {
+    return (
+      <View style={styles.container}>
+        <View style={styles.finishedContainer}>
+          <Text style={styles.finishedTitle}>No Photos Found</Text>
+          <Text style={styles.finishedSubtitle}>
+            Your photo library appears to be empty.
+          </Text>
+        </View>
+      </View>
+    );
+  }
+
   if (photos.length === 0) {
     return (
       <View style={styles.container}>
