@@ -9,6 +9,7 @@ import {
   AppState,
   AppStateStatus,
 } from "react-native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   Gesture,
   GestureDetector,
@@ -27,6 +28,18 @@ import { IconSymbol } from "./ui/icon-symbol";
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get("window");
 const SWIPE_THRESHOLD = SCREEN_WIDTH * 0.25;
+
+const CONFIRMED_CHANGESET_KEY = "swipic_confirmed_changeset";
+const CURRENT_CHANGESET_KEY = "swipic_current_changeset";
+
+interface Changeset {
+  id: string;
+  keptPhotoIds: string[];
+  markedForDeletionIds: string[];
+  currentIndex: number;
+  filteredPhotoIds: string[];
+  timestamp: number;
+}
 
 export default function PhotoSwiper() {
   const [photos, setPhotos] = useState<MediaLibrary.Asset[]>([]);
@@ -69,6 +82,75 @@ export default function PhotoSwiper() {
     },
     [keptPhotoIds, deletedPhotoIds, markedForDeletionIds]
   );
+
+  const saveChangeset = useCallback(
+    async (key: string, changeset: Changeset) => {
+      try {
+        await AsyncStorage.setItem(key, JSON.stringify(changeset));
+      } catch (error) {
+        console.error("Failed to save changeset:", error);
+      }
+    },
+    []
+  );
+
+  const loadChangeset = useCallback(
+    async (key: string): Promise<Changeset | null> => {
+      try {
+        const stored = await AsyncStorage.getItem(key);
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          return {
+            ...parsed,
+            keptPhotoIds: parsed.keptPhotoIds || [],
+            markedForDeletionIds: parsed.markedForDeletionIds || [],
+            filteredPhotoIds: parsed.filteredPhotoIds || [],
+          };
+        }
+      } catch (error) {
+        console.error("Failed to load changeset:", error);
+      }
+      return null;
+    },
+    []
+  );
+
+  const createChangeset = useCallback(
+    (
+      keptIds: Set<string> = new Set(),
+      markedIds: Set<string> = new Set(),
+      index: number = 0,
+      filtered: MediaLibrary.Asset[] = []
+    ): Changeset => {
+      return {
+        id: Date.now().toString(),
+        keptPhotoIds: Array.from(keptIds),
+        markedForDeletionIds: Array.from(markedIds),
+        currentIndex: index,
+        filteredPhotoIds: filtered.map((p) => p.id),
+        timestamp: Date.now(),
+      };
+    },
+    []
+  );
+
+  const startNewChangeset = useCallback(async () => {
+    const newChangeset = createChangeset(
+      keptPhotoIds,
+      markedForDeletionIds,
+      currentIndex,
+      filteredPhotos
+    );
+    await saveChangeset(CURRENT_CHANGESET_KEY, newChangeset);
+    return newChangeset;
+  }, [
+    createChangeset,
+    keptPhotoIds,
+    markedForDeletionIds,
+    currentIndex,
+    filteredPhotos,
+    saveChangeset,
+  ]);
 
   const resetCard = useCallback(() => {
     translateX.value = 0;
@@ -158,6 +240,13 @@ export default function PhotoSwiper() {
   const keepCurrentPhoto = () => {
     const currentPhoto = filteredPhotos[currentIndex];
     if (currentPhoto) {
+      // Handle changeset operations asynchronously in background
+      loadChangeset(CURRENT_CHANGESET_KEY).then(existingChangeset => {
+        if (!existingChangeset) {
+          startNewChangeset().catch(console.error);
+        }
+      }).catch(console.error);
+
       setLastAction({ type: "keep", photoId: currentPhoto.id });
 
       const newKeptIds = new Set(keptPhotoIds);
@@ -180,6 +269,13 @@ export default function PhotoSwiper() {
   const markCurrentPhotoForDeletion = () => {
     const currentPhoto = filteredPhotos[currentIndex];
     if (currentPhoto) {
+      // Handle changeset operations asynchronously in background
+      loadChangeset(CURRENT_CHANGESET_KEY).then(existingChangeset => {
+        if (!existingChangeset) {
+          startNewChangeset().catch(console.error);
+        }
+      }).catch(console.error);
+
       setLastAction({ type: "delete", photoId: currentPhoto.id });
 
       const newMarkedIds = new Set(markedForDeletionIds);
@@ -263,27 +359,39 @@ export default function PhotoSwiper() {
     resetCard();
   };
 
-  const resetWithConfirmation = () => {
-    Alert.alert(
-      "Reset Everything",
-      "This will clear all your keep and delete choices and start over. Are you sure?",
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Reset",
-          style: "destructive",
-          onPress: () => {
-            setKeptPhotoIds(new Set());
-            setMarkedForDeletionIds(new Set());
-            setLastAction(null);
-            setCurrentIndex(0);
-            setIsFinished(false);
-            filterPhotos(photos);
-            resetCard();
-          },
-        },
-      ]
+  const resetToChangeset = (changeset: Changeset) => {
+    setKeptPhotoIds(new Set(changeset.keptPhotoIds));
+    setMarkedForDeletionIds(new Set(changeset.markedForDeletionIds));
+    setLastAction(null);
+    setCurrentIndex(changeset.currentIndex);
+    setIsFinished(false);
+
+    // Restore the exact filtered photos state from the changeset
+    const restoredFiltered = photos.filter((photo) =>
+      changeset.filteredPhotoIds.includes(photo.id)
     );
+    setFilteredPhotos(restoredFiltered);
+    resetCard();
+  };
+
+  const handleReset = async () => {
+    const currentChangeset = await loadChangeset(CURRENT_CHANGESET_KEY);
+    const confirmedChangeset = await loadChangeset(CONFIRMED_CHANGESET_KEY);
+
+    if (currentChangeset) {
+      resetToChangeset(currentChangeset);
+      await AsyncStorage.removeItem(CURRENT_CHANGESET_KEY);
+    } else if (confirmedChangeset) {
+      resetToChangeset(confirmedChangeset);
+    } else {
+      setKeptPhotoIds(new Set());
+      setMarkedForDeletionIds(new Set());
+      setLastAction(null);
+      setCurrentIndex(0);
+      setIsFinished(false);
+      filterPhotos(photos);
+      resetCard();
+    }
   };
 
   const confirmDeletion = async () => {
@@ -302,7 +410,17 @@ export default function PhotoSwiper() {
         {
           text: "Delete",
           style: "destructive",
-          onPress: performBatchDeletion,
+          onPress: async () => {
+            const newConfirmedChangeset = createChangeset(
+              keptPhotoIds,
+              markedForDeletionIds,
+              currentIndex,
+              filteredPhotos
+            );
+            await saveChangeset(CONFIRMED_CHANGESET_KEY, newConfirmedChangeset);
+            await AsyncStorage.removeItem(CURRENT_CHANGESET_KEY);
+            await performBatchDeletion();
+          },
         },
       ]
     );
@@ -477,6 +595,8 @@ export default function PhotoSwiper() {
     );
   }
 
+  const hasNoChangesets =
+    keptPhotoIds.size === 0 && markedForDeletionIds.size === 0 && !lastAction;
   const currentPhoto = filteredPhotos[currentIndex];
 
   if (!currentPhoto) {
@@ -511,10 +631,18 @@ export default function PhotoSwiper() {
         </TouchableOpacity>
 
         <TouchableOpacity
-          style={styles.headerButton}
-          onPress={resetWithConfirmation}
+          style={[
+            styles.headerButton,
+            hasNoChangesets && styles.disabledButton,
+          ]}
+          onPress={handleReset}
+          disabled={hasNoChangesets}
         >
-          <IconSymbol name="arrow.clockwise" size={24} color="#fff" />
+          <IconSymbol
+            name="arrow.clockwise"
+            size={24}
+            color={hasNoChangesets ? "#666" : "#fff"}
+          />
         </TouchableOpacity>
 
         <TouchableOpacity
