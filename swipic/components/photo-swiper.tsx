@@ -23,6 +23,7 @@ import Animated, {
 import { scheduleOnRN } from "react-native-worklets";
 import { Image } from "expo-image";
 import * as MediaLibrary from "expo-media-library";
+import { IconSymbol } from "./ui/icon-symbol";
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get("window");
 const SWIPE_THRESHOLD = SCREEN_WIDTH * 0.25;
@@ -43,6 +44,10 @@ export default function PhotoSwiper() {
   const [permissionStatus, setPermissionStatus] = useState<string>("");
   const [isFinished, setIsFinished] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [lastAction, setLastAction] = useState<{
+    type: "keep" | "delete";
+    photoId: string;
+  } | null>(null);
 
   const appState = useRef(AppState.currentState);
 
@@ -153,6 +158,8 @@ export default function PhotoSwiper() {
   const keepCurrentPhoto = () => {
     const currentPhoto = filteredPhotos[currentIndex];
     if (currentPhoto) {
+      setLastAction({ type: "keep", photoId: currentPhoto.id });
+
       const newKeptIds = new Set(keptPhotoIds);
       newKeptIds.add(currentPhoto.id);
       setKeptPhotoIds(newKeptIds);
@@ -173,6 +180,8 @@ export default function PhotoSwiper() {
   const markCurrentPhotoForDeletion = () => {
     const currentPhoto = filteredPhotos[currentIndex];
     if (currentPhoto) {
+      setLastAction({ type: "delete", photoId: currentPhoto.id });
+
       const newMarkedIds = new Set(markedForDeletionIds);
       newMarkedIds.add(currentPhoto.id);
       setMarkedForDeletionIds(newMarkedIds);
@@ -205,11 +214,13 @@ export default function PhotoSwiper() {
       setDeletedPhotoIds(newDeletedIds);
       setMarkedForDeletionIds(new Set());
     } catch (error) {
-      console.error("Failed to delete photos:", error);
-      Alert.alert(
-        "Error",
-        "Failed to delete some photos. Please check permissions."
-      );
+      console.error("canceled delete:", error);
+      // Handle user denying deletion permission as cancellation
+      // Reset photos back to their original state
+      setMarkedForDeletionIds(new Set());
+      setIsFinished(false);
+      filterPhotos(photos);
+      resetCard();
     } finally {
       setIsDeleting(false);
     }
@@ -224,10 +235,77 @@ export default function PhotoSwiper() {
     setCurrentIndex(0);
     setIsFinished(false);
     setKeptPhotoIds(new Set());
+    setLastAction(null);
     const nonDeletedPhotos = photos.filter(
       (photo) => !deletedPhotoIds.has(photo.id)
     );
     setFilteredPhotos(nonDeletedPhotos);
+  };
+
+  const undoLastAction = () => {
+    if (!lastAction) return;
+
+    const { type, photoId } = lastAction;
+
+    if (type === "keep") {
+      const newKeptIds = new Set(keptPhotoIds);
+      newKeptIds.delete(photoId);
+      setKeptPhotoIds(newKeptIds);
+    } else if (type === "delete") {
+      const newMarkedIds = new Set(markedForDeletionIds);
+      newMarkedIds.delete(photoId);
+      setMarkedForDeletionIds(newMarkedIds);
+    }
+
+    setLastAction(null);
+    setIsFinished(false);
+    filterPhotos(photos);
+    resetCard();
+  };
+
+  const resetWithConfirmation = () => {
+    Alert.alert(
+      "Reset Everything",
+      "This will clear all your keep and delete choices and start over. Are you sure?",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Reset",
+          style: "destructive",
+          onPress: () => {
+            setKeptPhotoIds(new Set());
+            setMarkedForDeletionIds(new Set());
+            setLastAction(null);
+            setCurrentIndex(0);
+            setIsFinished(false);
+            filterPhotos(photos);
+            resetCard();
+          },
+        },
+      ]
+    );
+  };
+
+  const confirmDeletion = async () => {
+    if (markedForDeletionIds.size === 0) {
+      Alert.alert("No Photos", "No photos are marked for deletion.");
+      return;
+    }
+
+    Alert.alert(
+      "Confirm Deletion",
+      `Are you sure you want to delete ${markedForDeletionIds.size} photo${
+        markedForDeletionIds.size === 1 ? "" : "s"
+      }? This cannot be undone.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete",
+          style: "destructive",
+          onPress: performBatchDeletion,
+        },
+      ]
+    );
   };
 
   const panGesture = Gesture.Pan()
@@ -419,6 +497,42 @@ export default function PhotoSwiper() {
 
   return (
     <GestureHandlerRootView style={styles.container}>
+      <View style={styles.header}>
+        <TouchableOpacity
+          style={[styles.headerButton, !lastAction && styles.disabledButton]}
+          onPress={undoLastAction}
+          disabled={!lastAction}
+        >
+          <IconSymbol
+            name="arrow.uturn.backward"
+            size={24}
+            color={lastAction ? "#fff" : "#666"}
+          />
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={styles.headerButton}
+          onPress={resetWithConfirmation}
+        >
+          <IconSymbol name="arrow.clockwise" size={24} color="#fff" />
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[
+            styles.headerButton,
+            markedForDeletionIds.size === 0 && styles.disabledButton,
+          ]}
+          onPress={confirmDeletion}
+          disabled={markedForDeletionIds.size === 0}
+        >
+          <IconSymbol
+            name="checkmark"
+            size={24}
+            color={markedForDeletionIds.size > 0 ? "#fff" : "#666"}
+          />
+        </TouchableOpacity>
+      </View>
+
       <GestureDetector gesture={panGesture}>
         <Animated.View style={[styles.cardContainer, animatedStyle]}>
           <View style={styles.card}>
@@ -447,6 +561,25 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: "#000",
     paddingHorizontal: 20,
+  },
+  header: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingTop: 60,
+    paddingBottom: 20,
+    paddingHorizontal: 20,
+  },
+  headerButton: {
+    width: 50,
+    height: 50,
+    borderRadius: 25,
+    backgroundColor: "rgba(255, 255, 255, 0.1)",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  disabledButton: {
+    backgroundColor: "rgba(255, 255, 255, 0.05)",
   },
   cardContainer: {
     flex: 1,
