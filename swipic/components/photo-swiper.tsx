@@ -61,6 +61,8 @@ export default function PhotoSwiper() {
     type: "keep" | "delete";
     photoId: string;
   } | null>(null);
+  const [lastConfirmedKeptIds, setLastConfirmedKeptIds] = useState<Set<string>>(new Set());
+  const [lastConfirmedMarkedIds, setLastConfirmedMarkedIds] = useState<Set<string>>(new Set());
 
   const appState = useRef(AppState.currentState);
 
@@ -303,20 +305,30 @@ export default function PhotoSwiper() {
       const photosToDelete = Array.from(markedForDeletionIds);
       await MediaLibrary.deleteAssetsAsync(photosToDelete);
 
+      // Only create confirmed changeset after successful deletion
+      const newConfirmedChangeset = createChangeset(
+        keptPhotoIds,
+        markedForDeletionIds,
+        currentIndex,
+        filteredPhotos
+      );
+      await saveChangeset(CONFIRMED_CHANGESET_KEY, newConfirmedChangeset);
+      await AsyncStorage.removeItem(CURRENT_CHANGESET_KEY);
+
       const newDeletedIds = new Set([
         ...deletedPhotoIds,
         ...markedForDeletionIds,
       ]);
       setDeletedPhotoIds(newDeletedIds);
       setMarkedForDeletionIds(new Set());
+      setLastAction(null); // Clear last action to disable undo after confirmation
+      
+      // Update last confirmed state
+      setLastConfirmedKeptIds(new Set(keptPhotoIds));
+      setLastConfirmedMarkedIds(new Set());
     } catch (error) {
       console.error("canceled delete:", error);
-      // Handle user denying deletion permission as cancellation
-      // Reset photos back to their original state
-      setMarkedForDeletionIds(new Set());
-      setIsFinished(false);
-      filterPhotos(photos);
-      resetCard();
+      // User canceled deletion - keep current state intact, don't reset anything
     } finally {
       setIsDeleting(false);
     }
@@ -395,35 +407,28 @@ export default function PhotoSwiper() {
   };
 
   const confirmDeletion = async () => {
-    if (markedForDeletionIds.size === 0) {
-      Alert.alert("No Photos", "No photos are marked for deletion.");
+    if (!hasUnconfirmedChanges) {
       return;
     }
 
-    Alert.alert(
-      "Confirm Deletion",
-      `Are you sure you want to delete ${markedForDeletionIds.size} photo${
-        markedForDeletionIds.size === 1 ? "" : "s"
-      }? This cannot be undone.`,
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Delete",
-          style: "destructive",
-          onPress: async () => {
-            const newConfirmedChangeset = createChangeset(
-              keptPhotoIds,
-              markedForDeletionIds,
-              currentIndex,
-              filteredPhotos
-            );
-            await saveChangeset(CONFIRMED_CHANGESET_KEY, newConfirmedChangeset);
-            await AsyncStorage.removeItem(CURRENT_CHANGESET_KEY);
-            await performBatchDeletion();
-          },
-        },
-      ]
-    );
+    if (markedForDeletionIds.size > 0) {
+      await performBatchDeletion();
+    } else {
+      // Just save the current changeset if no photos to delete
+      const newConfirmedChangeset = createChangeset(
+        keptPhotoIds,
+        markedForDeletionIds,
+        currentIndex,
+        filteredPhotos
+      );
+      await saveChangeset(CONFIRMED_CHANGESET_KEY, newConfirmedChangeset);
+      await AsyncStorage.removeItem(CURRENT_CHANGESET_KEY);
+      setLastAction(null); // Clear last action to disable undo after confirmation
+      
+      // Update last confirmed state
+      setLastConfirmedKeptIds(new Set(keptPhotoIds));
+      setLastConfirmedMarkedIds(new Set(markedForDeletionIds));
+    }
   };
 
   const panGesture = Gesture.Pan()
@@ -597,6 +602,13 @@ export default function PhotoSwiper() {
 
   const hasNoChangesets =
     keptPhotoIds.size === 0 && markedForDeletionIds.size === 0 && !lastAction;
+  
+  // Check if current state differs from last confirmed state
+  const hasUnconfirmedChanges = 
+    keptPhotoIds.size !== lastConfirmedKeptIds.size ||
+    markedForDeletionIds.size !== lastConfirmedMarkedIds.size ||
+    ![...keptPhotoIds].every(id => lastConfirmedKeptIds.has(id)) ||
+    ![...markedForDeletionIds].every(id => lastConfirmedMarkedIds.has(id));
   const currentPhoto = filteredPhotos[currentIndex];
 
   if (!currentPhoto) {
@@ -648,15 +660,15 @@ export default function PhotoSwiper() {
         <TouchableOpacity
           style={[
             styles.headerButton,
-            markedForDeletionIds.size === 0 && styles.disabledButton,
+            !hasUnconfirmedChanges && styles.disabledButton,
           ]}
           onPress={confirmDeletion}
-          disabled={markedForDeletionIds.size === 0}
+          disabled={!hasUnconfirmedChanges}
         >
           <IconSymbol
             name="checkmark"
             size={24}
-            color={markedForDeletionIds.size > 0 ? "#fff" : "#666"}
+            color={hasUnconfirmedChanges ? "#fff" : "#666"}
           />
         </TouchableOpacity>
       </View>
